@@ -1,0 +1,169 @@
+```{r echo=FALSE}
+#get the time of the analysis/document creation
+time <- Sys.time()
+```
+---
+title: "How Well People Do An Exercise?"
+author: "Igor Telezhinsky"
+date: `r time`
+output: 
+  html_document: 
+    keep_md: yes
+---
+# Executive Summary
+*Aims*: The goal of the project is to predict the manner in which people did the exercise (i.e., how well they did the exercise).  
+*Methods*: We will use machine learning techniques to make predictions about how people performed the exercise.  
+*Data*: The data comes from the website here: http://groupware.les.inf.puc-rio.br/har (Weight Lifting Exercise Dataset). People were asked to perform barbell lifts correctly and incorrectly in 5 different ways. The data from the wearable devices with accelerometers is recorded to the data set. Detailed information is available at the website.  
+*Results*: We found a model that can predict the outcome with a very high accuracy.
+
+# Analysis
+## Loading required packages 
+```{r init, warning=FALSE, message=FALSE}
+setwd("~/Projects/Coursera/DataScienceSpec/MachineLearn/PA")
+#load required packeges (note: warnings and messages from loading packages are suppressed)
+library(plyr)
+library(randomForest)
+library(gbm)
+library(kernlab)
+library(caret)
+library(doMC)
+registerDoMC(cores = 4)
+```
+
+## Data Preparation
+The data comes with 159 predictors and a labeled outcome consisting of 5 classes. Unfortunately, most of the variables have more than 95% of missing data, so we reomove these predictors. We also remove observation id and time stamp recorded as date in character variable. *new_window* variable is removed because of the number of levels conflict with the final data used for the quiz (randomForest requires that the number of levels of a factor variable in the training set be the same as the number of levels of a factor variable in the *newdata* data set used for predictions). We split the data into *training*, *cross validation* and *testing* data set to estimate out of sample error. Finally, the data used for the quiz is prepared in the same manner as *training*, *cross validation* and *testing* data sets.
+
+```{r cache=TRUE}
+#reading raw training data set 
+trainNA      <- read.csv("pml-training.csv",header=TRUE, stringsAsFactors = FALSE, 
+                         na.strings = c("","NA","#DIV/0!"))
+
+#finding and removing all predictors that have more than 95% missing values
+trainNAfrac  <- as.data.frame(sapply(trainNA,function(x) mean(is.na(x))))
+colnames(trainNAfrac)<-c("percent_missing")
+mask_missing <- ifelse(trainNAfrac$percent_missing > 0.95, FALSE, TRUE)
+training  <- trainNA[,mask_missing]
+
+#remove variables: X=obs.id., time stamp in date format and new_window;
+#set remaining char col to factor variable
+training  <- training[,-c(1,5,6)];training[,1]<-as.factor(training[,1])
+
+#selecting cross validation (cv) and final model testing data sets
+set.seed(3)
+cvDataInd <- createDataPartition(y=training$classe, p=0.8,list=FALSE)
+cvDataset <- training[cvDataInd,]
+testingFM <- training[-cvDataInd,]
+
+#selecting cv training and testing dat sets
+inTrain   <- createDataPartition(y=cvDataset$classe,p=0.8,list=FALSE)
+cvTraining<- cvDataset[inTrain,]
+cvTesting <- cvDataset[-inTrain,]
+
+#outcome column
+ycol       <- ncol(cvTraining)
+
+#prepare quiz testing data set in the same manner as training data set
+testing_quiz <- read.csv("pml-testing.csv",header=TRUE, stringsAsFactors = FALSE,
+                         na.strings = c("","NA","#DIV/0!"))
+testing_quiz <- testing_quiz[,mask_missing]
+testing_quiz <- testing_quiz[,-c(1,5,6)]; testing_quiz[,1]<-as.factor(testing_quiz[,1])
+```
+
+## Building model
+
+Although the problem is not really complicated and probably a single model would do sufficiently good job, for the sake of practice we build the ensamble of various models proven to be most successful in kaggle competitions. The accuracy of its components is stored in the *acc* matrix discussed below. Our ensamble will consist of *random forest*, *boosted decision trees* and *support vector machine with gaussian kernel* components. Here is the training code:
+
+```{r cache=TRUE}
+#matrix for storing accuracy of the predictions
+acc        <- matrix(rep(NA,8),4,2)
+
+#let's use 8-fold cv for all methods 
+fitControl <- trainControl(method = "cv", number = 8)
+
+#random forest model training
+modFitRF   <- train(x = cvTraining[,-ycol], y = as.factor(cvTraining[,ycol]), 
+                    method = "rf", data = cvTraining, trControl = fitControl)
+predRF     <- predict(modFitRF, newdata = cvTesting[,-ycol])
+acc[1,1]   <- confusionMatrix(cvTesting[,ycol],predRF)$overall['Accuracy']
+
+#boosted decision trees model training
+modFitGBM  <- train(as.factor(classe) ~ ., 
+                    method = "gbm", data = cvTraining, trControl = fitControl, 
+                    verbose = FALSE)
+predGBM    <- predict(modFitGBM, newdata = cvTesting[,-ycol])
+acc[2,1]   <- confusionMatrix(cvTesting[,ycol],predGBM)$overall['Accuracy']
+
+#support vector machine model training
+modFitSVM  <- train(as.factor(classe) ~ ., 
+                    method = "svmRadial", data = cvTraining, trControl = fitControl)
+predSVM    <- predict(modFitSVM, newdata = cvTesting[,-ycol])
+acc[3,1]   <- confusionMatrix(cvTesting[,ycol],predSVM)$overall['Accuracy']
+
+#combined model from the above models
+combPred   <- data.frame(p1=predRF,p2=predGBM,p3=predSVM,classe=cvTesting$classe)
+combFit    <- train(classe ~ ., 
+                    method = "svmRadial", data = combPred, trControl = fitControl)
+predFinal  <- predict(combFit,combPred)
+acc[4,1]   <- confusionMatrix(cvTesting[,ycol],predFinal)$overall['Accuracy']
+```
+
+## Models' performance
+### Selection of tuning parameters
+
+The tuning parameters were automatically selected by the *train()* function. Here are a few plots showing optimization of *random forest*, *gbm* and *svm* model parameters with respect to model accuracy.
+
+```{r  echo=FALSE, out.width=c('300px', '300px'), fig.show='hold'}
+trellis.par.set(caretTheme())
+plot(modFitRF)
+plot(modFitGBM)
+plot(modFitSVM)
+```
+
+### *testing* data set
+
+Here we test the final combined model and its components on the *testing* data set to estimate out of sample error.  
+```{r cache=TRUE}
+#random forest predictor
+predRFT    <- predict(modFitRF,  newdata = testingFM[,-ycol])
+acc[1,2]   <- confusionMatrix(testingFM[,ycol],predRFT)$overall['Accuracy']
+
+#boosted decision tree predictor
+predGBMT   <- predict(modFitGBM, newdata = testingFM[,-ycol])
+acc[2,2]   <- confusionMatrix(testingFM[,ycol],predGBMT)$overall['Accuracy']
+
+#support vector machine predictor
+predSVMT   <- predict(modFitSVM, newdata = testingFM[,-ycol])
+acc[3,2]   <- confusionMatrix(testingFM[,ycol],predSVMT)$overall['Accuracy']
+
+#combined model prediction
+combPredT  <- data.frame(p1=predRFT,p2=predGBMT,p3=predSVMT)
+predFinalT <- predict(combFit,combPredT)
+acc[4,2]   <- confusionMatrix(testingFM[,ycol],predFinalT)$overall['Accuracy']
+```
+
+We provide the accuracy of the model components and of the combined model on the *cross validation* (CV) and on the out of sample (OOS) *testing* data sets. 
+
+```{r echo=FALSE}
+colnames(acc)<-c("CVtest","OOStest")
+rownames(acc)<-c("RF","GBM","SVM","Combined")
+acc
+```
+
+The behaviour is as desired: out of sample accuracy is just a bit lower than in sample suggesting that *no* heavy overfitting occured. We can also notice that the ensamble was probably not needed because *random forest* model alone is sufficiently good for this simple problem. Nevertheless, we will use our combined model for the quiz predictions. 
+
+# Predicting quiz answers
+Finally, we are ready to do predictions of the quiz.
+```{r cache=TRUE}
+#predictions of the components
+RF  <- predict(modFitRF,  newdata = testing_quiz[,-ycol])
+GBM <- predict(modFitGBM, newdata = testing_quiz[,-ycol])
+SVM <- predict(modFitSVM, newdata = testing_quiz[,-ycol])
+
+#prediction of the combined (ensamble) model
+cDF <- data.frame(p1=RF,p2=GBM,p3=SVM)
+QA  <- predict(combFit, newdata = cDF)
+```
+The model gained 100% for the quiz. The answers are not shown for the purpose of keeping them out of public internet domain.
+
+# Conclusions
+We have build a model that can predict with high accuracy how well people do certain physical execise. The model was successfuly used for the predictions of the quiz answers getting 100% correct result.
